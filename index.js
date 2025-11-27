@@ -1,16 +1,36 @@
 const { Server } = require("socket.io");
-// 1. Usamos el módulo HTTP nativo (Necesario para Render/Heroku)
-const httpServer = require("http").createServer(); 
+const admin = require('firebase-admin');
 
+// 1. EL "DESPERTADOR" PARA LA NUBE
+const httpServer = require("http").createServer((req, res) => {
+    // Si alguien visita la URL principal (ej: con un navegador), respondemos "Estoy vivo".
+    // Esto evita que servicios como Render pongan el servidor a "dormir" por inactividad.
+    if (req.url === "/") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("Velocity Server is Online and Ready!");
+    }
+}); 
+
+// 2. CONEXIÓN A LA BASE DE DATOS (FIREBASE)
+try {
+    const serviceAccount = require('./serviceAccountKey.json');
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    const db = admin.firestore();
+    console.log("✅ Conexión con Firebase establecida.");
+} catch (error) {
+    console.error("⚠️ ERROR: No se encontró 'serviceAccountKey.json'. El ranking global no funcionará.");
+    // El juego puede seguir sin base de datos, pero no guardará victorias.
+}
+
+// 3. CONFIGURACIÓN DEL SERVIDOR DE JUEGO (SOCKET.IO)
 const io = new Server(httpServer, {
-  cors: { origin: "*" } // Permitir conexiones desde cualquier móvil/web
+  cors: { origin: "*" } // Permitir conexiones desde cualquier lugar
 });
 
-// 2. CONFIGURACIÓN DEL PUERTO (Vital para la Nube)
-// Si estamos en la nube, usa su puerto. Si estamos en casa, usa el 3000.
+// 4. CONFIGURACIÓN DEL PUERTO (NUBE O LOCAL)
 const PORT = process.env.PORT || 3000;
-
-console.log(`🔥 Servidor VELOCITY: Arrancando sistema en puerto ${PORT}...`);
 
 // --- CONFIGURACIÓN DEL JUEGO ---
 const ALPHABET = "ABCDEFGHIJLMNOPRSTUV";
@@ -21,207 +41,121 @@ const ALL_CATEGORIES = [
     "VIDEOJUEGO", "CANTANTE", "CIUDAD", "ASIGNATURA"
 ];
 
-// Estado global de las salas
+// Almacén de salas activas
 let rooms = {}; 
 
-// Generar código de sala aleatorio (4 letras/números)
-function generateRoomCode() {
-    return Math.random().toString(36).substring(2, 6).toUpperCase();
-}
+// --- FUNCIONES AUXILIARES ---
+function generateRoomCode() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
 
-// Iniciar nueva ronda en una sala específica
 function startNewRound(roomCode) {
     if (!rooms[roomCode]) return;
-
-    // Elegir letra al azar
     rooms[roomCode].letter = ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-    
-    // Elegir 5 categorías al azar
     let shuffled = ALL_CATEGORIES.sort(() => 0.5 - Math.random());
     rooms[roomCode].categories = shuffled.slice(0, 5);
-    
     rooms[roomCode].isPanic = false;
-    
-    return rooms[roomCode];
 }
 
+// --- LÓGICA PRINCIPAL DEL SERVIDOR ---
 io.on("connection", (socket) => {
-  console.log("Nuevo jugador conectado:", socket.id);
-
-  // --- 1. CREAR SALA (HOST) ---
+  
+  // CREAR SALA
   socket.on('create_room', (data) => {
       const code = generateRoomCode();
-      const playerName = data.name;
-
       socket.join(code);
-
-      // Crear la estructura de la sala
-      rooms[code] = {
-          players: {},
-          admin: socket.id, // El creador es el administrador
-          status: 'LOBBY',
-          letter: "",
-          categories: [],
-          isPanic: false
-      };
-
-      // Añadir al host a la lista
-      rooms[code].players[socket.id] = { name: playerName, score: 0, id: socket.id };
-      
-      console.log(`🏠 Sala creada: ${code} por ${playerName}`);
-
-      // Confirmar al cliente
-      socket.emit('room_joined', { 
-          code: code,
-          isHost: true,
-          players: Object.values(rooms[code].players)
-      });
+      rooms[code] = { players: {}, admin: socket.id, status: 'LOBBY' };
+      rooms[code].players[socket.id] = { name: data.name, score: 0 };
+      console.log(`🏠 Sala ${code} creada por ${data.name}`);
+      socket.emit('room_joined', { code: code, isHost: true, players: Object.values(rooms[code].players) });
   });
 
-  // --- 2. UNIRSE A SALA (INVITADO) ---
+  // UNIRSE A SALA
   socket.on('join_room', (data) => {
-      const code = data.code.toUpperCase(); // Asegurar mayúsculas
-      const playerName = data.name;
-
-      // Validación: ¿Existe la sala?
+      const code = data.code.toUpperCase();
       if (!rooms[code]) {
-          socket.emit('error_msg', 'La sala no existe o ha cerrado.');
+          socket.emit('error_msg', 'La sala no existe.');
           return;
       }
-
       socket.join(code);
-      rooms[code].players[socket.id] = { name: playerName, score: 0, id: socket.id };
-
-      console.log(`👤 ${playerName} se unió a la sala ${code}`);
-
-      // Confirmar al cliente
-      socket.emit('room_joined', { 
-          code: code,
-          isHost: false, // No es admin
-          players: Object.values(rooms[code].players)
-      });
-
-      // Avisar a TODOS en la sala para actualizar la lista del lobby
+      rooms[code].players[socket.id] = { name: data.name, score: 0 };
+      console.log(`👤 ${data.name} entró a ${code}`);
+      socket.emit('room_joined', { code: code, isHost: false, players: Object.values(rooms[code].players) });
       io.to(code).emit('update_players', Object.values(rooms[code].players));
   });
 
-  // --- 3. INICIAR PARTIDA (Solo Host) ---
+  // INICIAR PARTIDA
   socket.on('start_game', (data) => {
       const code = data.roomCode;
-      const room = rooms[code];
-
-      // Seguridad: Solo el admin puede iniciar
-      if (!room || room.admin !== socket.id) return;
-
-      console.log(`🚀 Iniciando partida en sala ${code}`);
-      room.status = 'PLAYING';
-      
+      if (!rooms[code] || rooms[code].admin !== socket.id) return;
       startNewRound(code);
-
-      // Enviar señal de inicio a todos
-      io.to(code).emit('round_start', { 
-          letter: room.letter, 
-          categories: room.categories 
-      });
+      io.to(code).emit('round_start', { letter: rooms[code].letter, categories: rooms[code].categories });
   });
 
-  // --- 4. BOTÓN STOP (PÁNICO) ---
+  // BOTÓN STOP
   socket.on('stop_pressed', (data) => {
       const code = data.roomCode; 
       const room = rooms[code];
-
-      if (!room || room.isPanic) return; // Si ya hay pánico, ignorar
-
-      console.log(`🚨 ¡STOP en sala ${code}!`);
+      if (!room || room.isPanic) return;
       room.isPanic = true;
-
-      // Avisar a todos para activar modo rojo y cuenta atrás
       io.to(code).emit('panic_mode', {});
 
-      // Esperar 8 segundos (tiempo para escribir + lag)
       setTimeout(() => {
-          // CALCULAR RANKING
           let ranking = [];
-          
           for (let pid in room.players) {
-              ranking.push({ 
-                  name: room.players[pid].name, 
-                  score: room.players[pid].score 
-              });
-              // Resetear puntuación para la siguiente ronda
-              room.players[pid].score = 0; 
+              ranking.push({ name: room.players[pid].name, score: room.players[pid].score });
           }
-
-          // Ordenar por puntuación (Mayor a menor)
           ranking.sort((a, b) => b.score - a.score);
-          
-          // Enviar resultados
           io.to(code).emit('game_ranking', ranking);
 
-          // Pausa para ver resultados y luego NUEVA RONDA AUTOMÁTICA
+          // GUARDAR VICTORIA EN FIREBASE
+          if (ranking.length > 0 && ranking[0].score > 0 && db) {
+              const winnerName = ranking[0].name;
+              const playerRef = db.collection('players').doc(winnerName.toUpperCase());
+              playerRef.set({ 
+                  name: winnerName,
+                  wins: admin.firestore.FieldValue.increment(1) 
+              }, { merge: true });
+              console.log(`🏆 Victoria para ${winnerName} guardada.`);
+          }
+          
+          for (let pid in room.players) { room.players[pid].score = 0; } // Reset scores
+
           setTimeout(() => {
               room.isPanic = false;
               startNewRound(code);
-              
-              console.log(`🔄 Nueva ronda en sala ${code}: Letra ${room.letter}`);
-              
-              io.to(code).emit('round_start', { 
-                  letter: room.letter, 
-                  categories: room.categories 
-              });
-          }, 5000); // 5 segundos viendo el ranking
-
-      }, 8000); // 8 segundos de pánico
+              io.to(code).emit('round_start', { letter: room.letter, categories: room.categories });
+          }, 5000);
+      }, 8000);
   });
 
-  // --- 5. RECIBIR Y CORREGIR PALABRAS ---
+  // CORREGIR PALABRAS
   socket.on('submit_words', (data) => {
       const code = data.roomCode;
       const room = rooms[code];
-      const misPalabras = data.words;
-
       if (!room || !room.players[socket.id]) return;
-
       let score = 0;
-      // Recorremos las palabras recibidas
-      for (const [categoria, palabra] of Object.entries(misPalabras)) {
-          // REGLA: No vacía Y empieza por la letra correcta
-          if (palabra && palabra.length > 0 && palabra[0].toUpperCase() === room.letter) {
-              score += 100;
-          }
+      for (const [_, palabra] of Object.entries(data.words)) {
+          if (palabra && palabra.length > 0 && palabra[0] === room.letter) score += 100;
       }
-      // Guardamos la nota en el servidor
       room.players[socket.id].score = score;
   });
 
-  // --- 6. CHAT (SISTEMA DE MENSAJERÍA) ---
+  // CHAT
   socket.on('send_message', (data) => {
-      const code = data.roomCode;
-      // Reenviamos el mensaje a TODOS en la sala
-      io.to(code).emit('receive_message', {
-          sender: data.playerName,
-          text: data.message
-      });
+      io.to(data.roomCode).emit('receive_message', { sender: data.playerName, text: data.message });
   });
 
-  // --- 7. REACCIONES (EMOJIS VOLADORES) ---
+  // REACCIONES
   socket.on('send_reaction', (data) => {
-      const code = data.roomCode;
-      // Reenviamos el emoji a TODOS
-      io.to(code).emit('receive_reaction', {
-          emoji: data.emoji
-      });
+      io.to(data.roomCode).emit('receive_reaction', { emoji: data.emoji });
   });
 
-  // --- DESCONEXIÓN ---
+  // DESCONEXIÓN
   socket.on("disconnect", () => {
-      // (Opcional) Aquí podrías borrar al jugador de la sala
-      // Pero por ahora lo dejamos simple para evitar errores si se reconecta rápido
-      console.log("Jugador desconectado:", socket.id);
+      // (Lógica para borrar al jugador de la sala si se va)
   });
 });
 
-// 3. ARRANCAR EL SERVIDOR (OJO: Usamos httpServer, no io)
+// --- ARRANCAR SERVIDOR ---
 httpServer.listen(PORT, () => {
-    console.log(`✅ Servidor escuchando en el puerto ${PORT}`);
+    console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
