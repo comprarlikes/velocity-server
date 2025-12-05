@@ -52,6 +52,33 @@ async function updatePlayerProfile(name, avatar, frame) {
 }
 
 io.on("connection", (socket) => {
+    
+// --- NUEVO: MATCHMAKING (BUSCAR PARTIDA) ---
+  socket.on('find_match', (data) => {
+      let foundCode = null;
+      
+      // Buscar una sala que esté en LOBBY
+      for (let code in rooms) {
+          if (rooms[code].status === 'LOBBY') {
+              // Opcional: Comprobar si está llena (ej: < 8 jugadores)
+              if (Object.keys(rooms[code].players).length < 8) {
+                  foundCode = code;
+                  break;
+              }
+          }
+      }
+
+      if (foundCode) {
+          console.log(`🔍 Jugador ${data.name} encontró sala ${foundCode}`);
+          // Unimos al jugador a esa sala existente
+          socket.emit('match_found', { code: foundCode });
+      } else {
+          console.log(`🔍 No hay salas. Creando una nueva para ${data.name}...`);
+          // Si no hay salas, le decimos que cree una nueva
+          socket.emit('no_match_found', {});
+      }
+  });
+    
   
   // 1. CREAR SALA
   socket.on('create_room', (data) => {
@@ -162,3 +189,4 @@ io.on("connection", (socket) => {
 });
 
 httpServer.listen(PORT, () => { console.log(`✅ Servidor listo en ${PORT}`); });
+
