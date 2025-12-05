@@ -1,6 +1,5 @@
 const { Server } = require("socket.io");
 const admin = require('firebase-admin');
-
 const httpServer = require("http").createServer((req, res) => {
     if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Velocity Server is Online!"); }
 }); 
@@ -35,9 +34,26 @@ function startNewRound(roomCode) {
     for (let pid in room.players) { room.players[pid].score = 0; }
 }
 
+// --- NUEVA FUNCIÓN: ACTUALIZAR PERFIL EN FIREBASE ---
+async function updatePlayerProfile(name, avatar, frame) {
+    if (!db || !name) return;
+    try {
+        const playerRef = db.collection('players').doc(name.toUpperCase());
+        // Solo actualizamos avatar y marco, sin tocar las victorias
+        await playerRef.set({ 
+            name: name, // Aseguramos el nombre
+            avatar: avatar || 'robot1', 
+            frame: frame || 'none'
+        }, { merge: true }); // merge: true es CLAVE para no borrar las victorias
+        console.log(`🔄 Perfil actualizado en Firebase: ${name}`);
+    } catch (e) {
+        console.error("Error actualizando perfil:", e);
+    }
+}
+
 io.on("connection", (socket) => {
   
-  // 1. CREAR SALA (Recibimos avatar y marco)
+  // 1. CREAR SALA
   socket.on('create_room', (data) => {
       const code = generateRoomCode();
       socket.join(code);
@@ -46,13 +62,17 @@ io.on("connection", (socket) => {
           currentRound: 0, totalRounds: data.rounds || 3, roundTime: data.time || 60,
           stopMode: data.stopMode || 'BLITZ', letter: "", categories: [], isPanic: false
       };
+      
+      const pName = data.playerName || data.name;
       rooms[code].players[socket.id] = { 
-          name: data.playerName || data.name, 
-          score: 0, wins: 0, id: socket.id,
-          avatar: data.avatar || 'robot1', // Guardamos look
+          name: pName, score: 0, wins: 0, id: socket.id,
+          avatar: data.avatar || 'robot1',
           frame: data.frame || 'none' 
       };
-      console.log(`🏠 Sala ${code} creada por ${data.playerName} (Look: ${data.avatar})`);
+      
+      // ¡ACTUALIZAMOS FIREBASE AL MOMENTO!
+      updatePlayerProfile(pName, data.avatar, data.frame);
+
       socket.emit('room_joined', { code: code, isHost: true, players: Object.values(rooms[code].players) });
   });
 
@@ -61,11 +81,16 @@ io.on("connection", (socket) => {
       const code = data.code ? data.code.toUpperCase() : "";
       if (!rooms[code]) return socket.emit('error_msg', 'Sala no existe.');
       socket.join(code);
+      
       rooms[code].players[socket.id] = { 
           name: data.name, score: 0, wins: 0, id: socket.id,
           avatar: data.avatar || 'robot1',
           frame: data.frame || 'none'
       };
+      
+      // ¡ACTUALIZAMOS FIREBASE AL MOMENTO!
+      updatePlayerProfile(data.name, data.avatar, data.frame);
+
       socket.emit('room_joined', { code: code, isHost: false, players: Object.values(rooms[code].players) });
       io.to(code).emit('update_players', Object.values(rooms[code].players));
   });
@@ -100,16 +125,14 @@ io.on("connection", (socket) => {
           if (room.currentRound >= room.totalRounds) {
               let finalPodium = Object.values(room.players).sort((a,b) => b.wins - a.wins);
               
-              // GUARDAR EN FIREBASE CON AVATAR
               if (finalPodium.length > 0 && db) {
                   const winner = finalPodium[0];
+                  // También actualizamos al ganar por si acaso
+                  updatePlayerProfile(winner.name, winner.avatar, winner.frame);
+                  
+                  // Sumamos la victoria
                   const playerRef = db.collection('players').doc(winner.name.toUpperCase());
-                  playerRef.set({ 
-                      name: winner.name,
-                      wins: admin.firestore.FieldValue.increment(1),
-                      avatar: winner.avatar, // ¡Guardar!
-                      frame: winner.frame    // ¡Guardar!
-                  }, { merge: true });
+                  playerRef.set({ wins: admin.firestore.FieldValue.increment(1) }, { merge: true });
               }
               io.to(code).emit('match_over', finalPodium);
           } else {
