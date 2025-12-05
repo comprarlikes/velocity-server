@@ -1,7 +1,11 @@
 const { Server } = require("socket.io");
 const admin = require('firebase-admin');
 const httpServer = require("http").createServer((req, res) => {
-    if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Velocity Server is Online!"); }
+    // Despertador para Render
+    if (req.url === "/") { 
+        res.writeHead(200, { "Content-Type": "text/plain" }); 
+        res.end("Velocity Server is Online and Ready!"); 
+    }
 }); 
 
 let db;
@@ -9,40 +13,42 @@ try {
     const serviceAccount = require('./serviceAccountKey.json');
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
+    console.log("✅ Conexión con Firebase establecida.");
 } catch (error) {
     console.error("⚠️ ERROR: No se encontró 'serviceAccountKey.json'. Ranking desactivado.");
+    db = null;
 }
 
 const io = new Server(httpServer, { cors: { origin: "*" } });
 const PORT = process.env.PORT || 3000;
 
+// --- CONFIGURACIÓN DEL JUEGO ---
 const ALPHABET = "ABCDEFGHIJLMNOPRSTUV";
 const ALL_CATEGORIES = ["NOMBRE", "COLOR", "FRUTA", "PAÍS", "ANIMAL", "MARCA", "COMIDA", "OBJETO", "PROFESIÓN", "PELÍCULA", "SERIE", "FAMOSO"];
-const TOTAL_ROUNDS = 3;
+const TOTAL_ROUNDS = 3; 
 
 let rooms = {}; 
 let globalGameData = {}; // Guarda palabras y votos temporales
 
 function generateRoomCode() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
 
-function startNewRound(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return;
+// FUNCIÓN DE INICIO DE RONDA
+function prepareRoundData(room) {
     room.currentRound += 1;
     room.letter = ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-    let shuffled = ALL_CATEGORIES.sort(() => 0.5 - math.random());
+    let shuffled = ALL_CATEGORIES.sort(() => 0.5 - Math.random());
     room.categories = shuffled.slice(0, 5);
     room.isPanic = false;
     for (let pid in room.players) { room.players[pid].score = 0; }
+    return room;
 }
 
-// PROCESA VOTOS, CALCULA PUNTOS Y TERMINA LA RONDA
+// PROCESAR VOTOS (FUNCIÓN CENTRAL)
 function _processVotesAndEndRound(code) {
     const room = rooms[code];
     const gameData = globalGameData[code];
-    let roundRanking = [];
+    let finalRanking = [];
 
-    // 1. Procesar Palabras y Puntuación de CADA JUGADOR
     for (const [votedPlayerId, playerWords] of Object.entries(gameData.playerWords)) {
         let roundScore = 0;
         const votedPlayerName = room.players[votedPlayerId].name;
@@ -51,47 +57,38 @@ function _processVotesAndEndRound(code) {
             if (word.length > 0 && word[0].toUpperCase() === room.letter) {
                 
                 let votesAgainst = 0;
-                
-                // Sumar votos de todos los jugadores que votaron "Inválido"
                 for (const [voterName, votes] of Object.entries(gameData.votes)) {
-                    // Cuidado: el voto es por nombre, el playerWords es por ID
                     if (votes[votedPlayerName] && votes[votedPlayerName][category] === 'invalid') {
                         votesAgainst++;
                     }
                 }
                 
-                // Regla: Si la mayoría vota en contra (N/2), la palabra es inválida
+                // Regla de la Mayoría: Si menos de la mitad vota en contra, es válido.
                 const totalVoters = Object.keys(room.players).length;
                 if (votesAgainst < Math.ceil(totalVoters / 2)) {
-                    // Si pasa la votación, da 10 puntos (simplificado)
                     roundScore += 100;
                 }
             }
         }
         
-        // 2. Actualizar Score y Ranking de Ronda
         room.players[votedPlayerId].score = roundScore; 
-        
-        // Añadir al ranking de ronda si tiene puntos
         if (roundScore > 0) {
-            roundRanking.push(room.players[votedPlayerId]);
+            finalRanking.push(room.players[votedPlayerId]);
         }
     }
     
-    // 3. Determinar Ganador de la Ronda y Asignar 'wins'
-    roundRanking.sort((a,b) => b.score - a.score);
-    if (roundRanking.length > 0 && roundRanking[0].score > 0) {
-        const winnerId = roundRanking[0].id;
+    finalRanking.sort((a,b) => b.score - a.score);
+    if (finalRanking.length > 0 && finalRanking[0].score > 0) {
+        const winnerId = finalRanking[0].id;
         if (room.players[winnerId]) {
             room.players[winnerId].wins += 1;
         }
     }
 
-    // 4. Enviar Ranking
-    io.to(code).emit('game_ranking', roundRanking.map(p => ({name: p.name, score: p.score}))); // Solo nombre y score
+    io.to(code).emit('game_ranking', finalRanking.map(p => ({name: p.name, score: p.score})));
     
-    // 5. Iniciar siguiente paso
-    if (room.currentRound >= TOTAL_ROUNDS) {
+    // LIMPIAR E INICIAR NUEVA RONDA O PARTIDA
+    if (room.currentRound >= room.totalRounds) {
         let finalPodium = Object.values(room.players).sort((a,b) => b.wins - a.wins);
         if (finalPodium.length > 0 && db) {
             const winner = finalPodium[0];
@@ -103,77 +100,120 @@ function _processVotesAndEndRound(code) {
     } else {
         setTimeout(() => {
             room.status = 'PLAYING';
-            startNewRound(code);
+            prepareRoundData(room);
             io.to(code).emit('round_start', { letter: room.letter, categories: room.categories, round: room.currentRound, totalRounds: room.totalRounds, time: room.roundTime });
         }, 5000);
     }
     
-    // Limpiar datos temporales
     delete globalGameData[code];
 }
 
 io.on("connection", (socket) => {
   
-  // CREAR SALA (Similar a antes)
+  // 1. CREAR SALA (CORREGIDO)
   socket.on('create_room', (data) => {
       const code = generateRoomCode();
+      const pName = data.playerName || data.name;
+
+      // 1. CREAR EL OBJETO SALA
+      rooms[code] = { 
+          players: {}, 
+          admin: socket.id, 
+          status: 'LOBBY',
+          currentRound: 0,
+          totalRounds: data.rounds || TOTAL_ROUNDS, // Usa valor de configuración o 3
+          roundTime: data.time || 60,
+          stopMode: data.stopMode || 'BLITZ',
+          password: data.password || null, // Para salas privadas
+          letter: "", categories: [], isPanic: false
+      };
+      
+      // 2. UNIRSE A LA SALA EN SOCKET.IO
       socket.join(code);
-      rooms[code] = { /* ... configuración ... */ };
-      const pData = { name: data.playerName || data.name, score: 0, wins: 0, id: socket.id, avatar: data.avatar || 'robot1', frame: data.frame || 'none' };
-      rooms[code].players[socket.id] = pData;
-      // Actualizar Firebase al entrar
-      if (db) db.collection('players').doc(pData.name.toUpperCase()).set({ name: pData.name, avatar: pData.avatar, frame: pData.frame }, { merge: true });
+
+      // 3. AÑADIR AL JUGADOR
+      rooms[code].players[socket.id] = { 
+          name: pName, score: 0, wins: 0, id: socket.id,
+          avatar: data.avatar || 'robot1',
+          frame: data.frame || 'none' 
+      };
+      
+      console.log(`🏠 Sala ${code} creada por ${pName}.`);
+      
+      // 4. ACTUALIZAR FIREBASE Y ENVIAR RESPUESTA
+      if (db) db.collection('players').doc(pName.toUpperCase()).set({ name: pName, avatar: data.avatar, frame: data.frame }, { merge: true });
       socket.emit('room_joined', { code: code, isHost: true, players: Object.values(rooms[code].players) });
   });
 
-  // UNIRSE A SALA (Similar a antes)
+  // 2. UNIRSE A SALA (Revisado)
   socket.on('join_room', (data) => {
       const code = data.code ? data.code.toUpperCase() : "";
       if (!rooms[code]) return socket.emit('error_msg', 'Sala no existe.');
+      
+      if (Object.keys(rooms[code].players).length >= 8) return socket.emit('error_msg', 'La sala está llena.');
+
       socket.join(code);
       const pData = { name: data.name, score: 0, wins: 0, id: socket.id, avatar: data.avatar || 'robot1', frame: data.frame || 'none' };
       rooms[code].players[socket.id] = pData;
+      
       if (db) db.collection('players').doc(pData.name.toUpperCase()).set({ name: pData.name, avatar: pData.avatar, frame: pData.frame }, { merge: true });
       socket.emit('room_joined', { code: code, isHost: false, players: Object.values(rooms[code].players) });
       io.to(code).emit('update_players', Object.values(rooms[code].players));
   });
 
-  // START GAME (Similar a antes)
+  // 3. INICIAR PARTIDA
   socket.on('start_game', (data) => {
       const code = data.roomCode;
       const room = rooms[code];
       if (!room || room.admin !== socket.id) return;
-      startNewRound(code);
-      io.to(code).emit('round_start', { letter: room.letter, categories: room.categories, round: room.currentRound, totalRounds: TOTAL_ROUNDS, time: room.roundTime });
+      
+      prepareRoundData(room);
+      
+      io.to(code).emit('round_start', { 
+          letter: room.letter, categories: room.categories, round: room.currentRound, totalRounds: room.totalRounds, time: room.roundTime
+      });
   });
 
-  // PULSAR STOP (Solo activa la fase de SUBMIT)
+  // 4. BUSCAR PARTIDA (Matchmaking)
+  socket.on('find_match', (data) => {
+      for (let code in rooms) {
+          if (rooms[code].status === 'LOBBY' && Object.keys(rooms[code].players).length < 8 && rooms[code].password === null) {
+              console.log(`🔍 Jugador ${data.name} encontró sala ${code}`);
+              socket.emit('match_found', { code: code });
+              return;
+          }
+      }
+      // Si llega aquí, no encontró nada, le decimos que cree
+      socket.emit('no_match_found', {});
+  });
+
+  // 5. BOTÓN STOP (Solo señal de tiempo)
   socket.on('stop_pressed', (data) => {
-      const code = data.roomCode; const room = rooms[code];
+      const code = data.roomCode; 
+      const room = rooms[code];
       if (!room || room.isPanic) return;
+
       room.isPanic = true;
       io.to(code).emit('panic_mode', {});
       
-      // Enviamos la señal a todos de que el tiempo se acaba.
-      // El cliente debe enviar SUBMIT_WORDS cuando el tiempo llegue a 0.
+      // El cliente enviará submit_words cuando su contador de pánico llegue a cero.
   });
 
-  // RECIBIR PALABRAS
+  // 6. RECIBIR PALABRAS
   socket.on('submit_words', (data) => {
       const code = data.roomCode;
       const room = rooms[code];
       const playerName = rooms[code].players[socket.id].name;
-
+      
       if (!room || room.status === 'JUDGING' || room.status === 'LOBBY') return;
       
-      // Guardar palabras
       if (!globalGameData[code]) { globalGameData[code] = { playerWords: {}, votes: {} }; }
       globalGameData[code].playerWords[playerName] = data.words; 
-      
-      // Simulación de final de tiempo: Si todos envían, iniciamos el Juicio.
+
       const allPlayers = Object.keys(room.players).map(id => room.players[id].name);
       const submittedPlayers = Object.keys(globalGameData[code].playerWords);
 
+      // Si todos enviaron, iniciamos el Juicio
       if (allPlayers.every(player => submittedPlayers.includes(player))) {
           room.status = 'JUDGING';
           io.to(code).emit('start_judging', { 
@@ -183,9 +223,9 @@ io.on("connection", (socket) => {
       }
   });
 
-  // RECIBIR VOTO
+  // 7. RECIBIR VOTO
   socket.on('submit_vote', (data) => {
-      const code = data.roomCode;
+      const code = data.code;
       const playerName = rooms[code].players[socket.id].name;
       const room = rooms[code];
       
@@ -201,8 +241,7 @@ io.on("connection", (socket) => {
       }
   });
 
-
   socket.on("disconnect", () => { /* ... */ });
 });
 
-httpServer.listen(PORT, () => { console.log(`✅ Servidor listo en ${PORT}`); });
+httpServer.listen(PORT, () => { console.log(`✅ Servidor listo en puerto ${PORT}`); });
