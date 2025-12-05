@@ -23,7 +23,7 @@ const ALL_CATEGORIES = ["NOMBRE", "COLOR", "FRUTA", "PAÍS", "ANIMAL", "MARCA", 
 const DEFAULT_ROUNDS = 3;
 
 let rooms = {}; 
-let globalGameData = {}; 
+let globalGameData = {}; // Guarda palabras y votos temporales
 
 function generateRoomCode() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
 
@@ -55,8 +55,6 @@ function _processVotesAndEndRound(code) {
                 
                 let votesAgainst = 0;
                 
-                // Sumar votos de todos los jugadores que votaron "Inválido"
-                // Solo contamos votos si hay más de 1 jugador, si no, siempre es válido (el usuario no vota su palabra)
                 if (Object.keys(room.players).length > 1) {
                     for (const [voterName, votes] of Object.entries(gameData.votes)) {
                         if (votes[playerName] && votes[playerName][category] === 'invalid') {
@@ -66,9 +64,8 @@ function _processVotesAndEndRound(code) {
                 }
                 
                 const totalVoters = Object.keys(room.players).length;
-                // Si la palabra es de 1 jugador, siempre es válida (pasa por defecto)
                 if (totalVoters === 1 || votesAgainst < Math.ceil(totalVoters / 2)) {
-                    roundScore += 100; 
+                    roundScore += 100;
                 }
             }
         }
@@ -133,8 +130,6 @@ io.on("connection", (socket) => {
       socket.join(code);
       rooms[code].players[socket.id] = { name: pName, score: 0, wins: 0, id: socket.id, avatar: data.avatar || 'robot1', frame: data.frame || 'none' };
       
-      console.log(`🏠 Sala ${code} creada por ${pName}.`);
-      
       if (db) db.collection('players').doc(pName.toUpperCase()).set({ name: pName, avatar: data.avatar, frame: data.frame }, { merge: true });
       socket.emit('room_joined', { code: code, isHost: true, players: Object.values(rooms[code].players) });
   });
@@ -163,8 +158,6 @@ io.on("connection", (socket) => {
       
       prepareRoundData(room);
       
-      console.log(`🚀 Iniciando partida en sala ${code}`);
-      
       io.to(code).emit('round_start', { 
           letter: room.letter, categories: room.categories, round: room.currentRound, totalRounds: room.totalRounds, time: room.roundTime
       });
@@ -192,8 +185,6 @@ io.on("connection", (socket) => {
       if (!room || room.isPanic) return;
 
       room.isPanic = true;
-      console.log(`🚨 STOP pulsado en sala ${code}`);
-      
       io.to(code).emit('panic_mode', {});
   });
 
@@ -208,14 +199,13 @@ io.on("connection", (socket) => {
       
       if (!globalGameData[code]) { globalGameData[code] = { playerWords: {}, votes: {} }; }
       
-      globalGameData[code].playerWords[socket.id] = data.words; 
+      globalGameData[code].playerWords[playerName] = data.words; 
 
-      const allPlayerIds = Object.keys(room.players);
-      const submittedPlayerIds = Object.keys(globalGameData[code].playerWords);
+      const allPlayerNames = Object.keys(room.players).map(id => room.players[id].name);
+      const submittedPlayerNames = Object.keys(globalGameData[code].playerWords);
 
-      // LÓGICA DE JUICIO: Si todos han enviado O si solo hay un jugador
       let shouldStartJudging = false;
-      if (allPlayerIds.every(id => submittedPlayerIds.includes(id))) {
+      if (allPlayerNames.every(name => submittedPlayerNames.includes(name)) || allPlayerNames.length === submittedPlayerNames.length) {
           shouldStartJudging = true;
       } 
       
@@ -223,12 +213,10 @@ io.on("connection", (socket) => {
           room.status = 'JUDGING';
           
           let wordsForClient = {};
-          for (let pid in globalGameData[code].playerWords) {
-              let pName = room.players[pid].name;
-              wordsForClient[pName] = globalGameData[code].playerWords[pid];
+          for (let pName in globalGameData[code].playerWords) {
+              wordsForClient[pName] = globalGameData[code].playerWords[pName];
           }
 
-          console.log(`⚖️ Iniciando juicio en sala ${code}`);
           io.to(code).emit('start_judging', { 
               words: wordsForClient
           });
@@ -237,7 +225,7 @@ io.on("connection", (socket) => {
 
   // 7. RECIBIR VOTOS
   socket.on('submit_vote', (data) => {
-      const code = data.roomCode; // El cliente debe enviar roomCode, no code
+      const code = data.roomCode;
       const room = rooms[code];
       
       if (!room || room.status !== 'JUDGING') return;
@@ -246,13 +234,11 @@ io.on("connection", (socket) => {
       
       if (!globalGameData[code]) return;
 
-      // Guardar voto
       globalGameData[code].votes[playerName] = data.votes;
       
       const totalPlayers = Object.keys(room.players).length;
       const totalVotes = Object.keys(globalGameData[code].votes).length;
 
-      // Si todos han votado, procesamos
       if (totalVotes === totalPlayers) { 
           _processVotesAndEndRound(code);
       }
