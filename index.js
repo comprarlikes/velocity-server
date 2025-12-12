@@ -1,7 +1,7 @@
 const { Server } = require("socket.io");
 const admin = require('firebase-admin');
 const httpServer = require("http").createServer((req, res) => {
-    if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Velocity Server (with Bots) is Online!"); }
+    if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Velocity Server is Online!"); }
 }); 
 
 let db;
@@ -21,7 +21,9 @@ const PORT = process.env.PORT || 3000;
 // --- CONFIGURACIÓN ---
 const ALPHABET = "ABCDEFGHIJLMNOPRSTUV";
 const ALL_CATEGORIES = ["NOMBRE", "COLOR", "FRUTA", "PAÍS", "ANIMAL", "MARCA", "COMIDA", "OBJETO", "PROFESIÓN", "PELÍCULA", "SERIE", "FAMOSO"];
-const TOTAL_ROUNDS = 3;
+const DEFAULT_ROUNDS = 3;
+
+// ¡AQUÍ FALTABA ESTO! LISTA DE NOMBRES DE BOTS
 const BOT_NAMES = ["Alex", "Sofía", "ProGamer", "Luna", "Max", "Leo", "Valeria", "VelocityBot", "Neo", "Trinity"];
 
 let rooms = {}; 
@@ -44,97 +46,80 @@ function startNewRound(roomCode) {
         room.players[pid].score = 0;
     }
 
-    // --- LÓGICA DEL BOT ---
-    // Si hay un bot en la sala, programamos su comportamiento
-    const botId = Object.keys(room.players).find(id => room.players[id].isBot);
-    if (botId) {
-        handleBotTurn(room, botId, roomCode);
+    // SI HAY BOT, PROGRAMAR SU JUGADA
+    const botPlayer = Object.values(room.players).find(p => p.isBot);
+    if (botPlayer) {
+        handleBotTurn(room, botPlayer.id, roomCode);
     }
 
     return room;
 }
 
-// --- INTELIGENCIA ARTIFICIAL DEL BOT ---
+// --- IA DEL BOT ---
 function handleBotTurn(room, botId, roomCode) {
-    // 1. Calcular cuánto tardará el bot (entre 40 y 55 segundos)
-    const botThinkingTime = (Math.floor(Math.random() * 15) + 40) * 1000;
+    // El bot piensa entre 30 y 50 segundos
+    const botThinkingTime = (Math.floor(Math.random() * 20) + 30) * 1000;
     
     console.log(`🤖 Bot ${room.players[botId].name} pensando... (${botThinkingTime/1000}s)`);
 
-    // Guardamos el timeout en la sala para poder cancelarlo si el humano gana antes
+    // Limpiar timer anterior si existe
+    if (room.botTimer) clearTimeout(room.botTimer);
+
     room.botTimer = setTimeout(() => {
         if (room.status !== 'PLAYING' || room.isPanic) return;
 
-        console.log(`🤖 Bot ${room.players[botId].name} pulsa STOP!`);
+        console.log(`🤖 Bot ${room.players[botId].name} termina y pulsa STOP!`);
 
-        // 2. Generar palabras del Bot
+        // 1. Generar palabras del Bot
         let botWords = {};
         room.categories.forEach(cat => {
-            // El bot es un poco vago, pone "Animal con A", "Color con A"
-            // (Suficiente para que el sistema lo dé por válido)
             botWords[cat] = `${cat} ${room.letter}`; 
         });
 
-        // 3. Simular envío de palabras
-        // Llamamos a la lógica de submit interna
-        handleSubmitWords(roomCode, botId, botWords);
+        // 2. Guardar palabras
+        if (!globalGameData[roomCode]) { globalGameData[roomCode] = { playerWords: {}, votes: {} }; }
+        globalGameData[roomCode].playerWords[botId] = botWords;
 
-        // 4. El Bot pulsa STOP
-        handleStop(roomCode, botId);
+        // 3. Pulsar STOP
+        handleStop(roomCode);
 
     }, botThinkingTime);
 }
 
-function handleStop(code, playerId) {
+function handleStop(code) {
     const room = rooms[code];
     if (!room || room.isPanic) return;
 
     room.isPanic = true;
     io.to(code).emit('panic_mode', {});
     
-    // Disparar final de ronda tras 8 segundos
-    setTimeout(() => finalizeRound(code), 8000);
-}
-
-function handleSubmitWords(code, playerId, words) {
-    const room = rooms[code];
-    if (!room) return;
-
-    // Guardar palabras
-    if (!globalGameData[code]) { globalGameData[code] = { playerWords: {}, votes: {} }; }
-    
-    // Si es un bot, simulamos el socket.id con su ID interno
-    const pName = room.players[playerId].name;
-    globalGameData[code].playerWords[playerId] = words;
+    // Forzar el fin de ronda tras 8 segundos (tiempo de pánico)
+    setTimeout(() => {
+        finalizeRound(code);
+    }, 8000);
 }
 
 function finalizeRound(code) {
     const room = rooms[code];
     if (!room) return;
 
-    // Calcular puntos
+    // Calcular puntos (Juez Automático)
     let roundRanking = [];
-    const gameData = globalGameData[code];
+    const gameData = globalGameData[code] || { playerWords: {} };
 
-    if (gameData && gameData.playerWords) {
-        for (let pid in room.players) {
-            let pScore = 0;
-            const words = gameData.playerWords[pid];
-            
-            if (words) {
-                for (const [cat, word] of Object.entries(words)) {
-                    // Validación simple: no vacío y letra correcta
-                    if (word && word.length > 0 && word[0].toUpperCase() === room.letter) {
-                        pScore += 100;
-                    }
+    for (let pid in room.players) {
+        let pScore = 0;
+        const words = gameData.playerWords ? gameData.playerWords[pid] : null;
+        
+        if (words) {
+            for (const [cat, word] of Object.entries(words)) {
+                if (word && word.length > 0 && word[0].toUpperCase() === room.letter) {
+                    pScore += 100;
                 }
             }
-            room.players[pid].score = pScore;
-            roundRanking.push(room.players[pid]);
         }
-    } else {
-        // Si nadie envió nada (raro)
-        for (let pid in room.players) roundRanking.push(room.players[pid]);
+        room.players[pid].score = pScore;
+        roundRanking.push(room.players[pid]);
     }
 
     // Ordenar y victorias
@@ -149,7 +134,7 @@ function finalizeRound(code) {
     // Fin de partida o siguiente ronda
     if (room.currentRound >= room.totalRounds) {
         let finalPodium = Object.values(room.players).sort((a,b) => b.wins - a.wins);
-        // Guardar solo si ganó un humano (opcional)
+        // Guardar solo si ganó un humano
         if (finalPodium.length > 0 && !finalPodium[0].isBot && db) {
              const winner = finalPodium[0];
              db.collection('players').doc(winner.name.toUpperCase()).set({ 
@@ -158,7 +143,7 @@ function finalizeRound(code) {
              }, { merge: true });
         }
         io.to(code).emit('match_over', finalPodium);
-        // Limpiar sala
+        // Limpieza
         delete rooms[code];
         delete globalGameData[code];
     } else {
@@ -172,51 +157,57 @@ function finalizeRound(code) {
     }
 }
 
-
 io.on("connection", (socket) => {
-  console.log("Jugador conectado:", socket.id);
-
+  
+  // 1. CREAR SALA
   socket.on('create_room', (data) => {
       const code = generateRoomCode();
       socket.join(code);
       rooms[code] = { 
           players: {}, admin: socket.id, status: 'LOBBY',
-          currentRound: 0, totalRounds: data.rounds || 3, roundTime: data.time || 60,
+          currentRound: 0, totalRounds: data.rounds || DEFAULT_ROUNDS, roundTime: data.time || 60,
           stopMode: data.stopMode || 'BLITZ', letter: "", categories: [], isPanic: false
       };
+      
       const pName = data.playerName || data.name;
-      rooms[code].players[socket.id] = { name: pName, score: 0, wins: 0, id: socket.id, avatar: data.avatar || 'robot1', frame: data.frame || 'none' };
+      rooms[code].players[socket.id] = { 
+          name: pName, score: 0, wins: 0, id: socket.id,
+          avatar: data.avatar || 'robot1', frame: data.frame || 'none' 
+      };
       
       if (db) db.collection('players').doc(pName.toUpperCase()).set({ name: pName, avatar: data.avatar, frame: data.frame }, { merge: true });
       socket.emit('room_joined', { code: code, isHost: true, players: Object.values(rooms[code].players) });
   });
 
+  // 2. UNIRSE A SALA
   socket.on('join_room', (data) => {
       const code = data.code ? data.code.toUpperCase() : "";
       if (!rooms[code]) return socket.emit('error_msg', 'Sala no existe.');
-      if (Object.keys(rooms[code].players).length >= 8) return socket.emit('error_msg', 'La sala está llena.');
-
-      socket.join(code);
-      const pData = { name: data.name, score: 0, wins: 0, id: socket.id, avatar: data.avatar || 'robot1', frame: data.frame || 'none' };
-      rooms[code].players[socket.id] = pData;
-      if (db) db.collection('players').doc(pData.name.toUpperCase()).set({ name: pData.name, avatar: pData.avatar, frame: pData.frame }, { merge: true });
       
+      socket.join(code);
+      const pData = { 
+          name: data.name, score: 0, wins: 0, id: socket.id, 
+          avatar: data.avatar || 'robot1', frame: data.frame || 'none' 
+      };
+      rooms[code].players[socket.id] = pData;
+      
+      if (db) db.collection('players').doc(pData.name.toUpperCase()).set({ name: pData.name, avatar: pData.avatar, frame: pData.frame }, { merge: true });
       socket.emit('room_joined', { code: code, isHost: false, players: Object.values(rooms[code].players) });
       io.to(code).emit('update_players', Object.values(rooms[code].players));
   });
 
+  // 3. INICIAR PARTIDA
   socket.on('start_game', (data) => {
       const code = data.roomCode;
       const room = rooms[code];
       if (!room || room.admin !== socket.id) return;
-      
       startNewRound(code);
       io.to(code).emit('round_start', { letter: room.letter, categories: room.categories, round: room.currentRound, totalRounds: room.totalRounds, time: room.roundTime });
   });
 
-  // --- MATCHMAKING CON BOTS ---
+  // 4. FIND MATCH (CON BOTS)
   socket.on('find_match', (data) => {
-      // 1. Buscar sala real
+      // Intentar unirse a sala existente
       for (let code in rooms) {
           if (rooms[code].status === 'LOBBY' && Object.keys(rooms[code].players).length < 8 && !rooms[code].hasBot) {
               socket.emit('match_found', { code: code });
@@ -224,7 +215,7 @@ io.on("connection", (socket) => {
           }
       }
 
-      // 2. SI NO HAY SALA, CREAMOS UNA CON BOT
+      // Si no, crear sala con BOT
       const code = generateRoomCode();
       socket.join(code);
       
@@ -232,49 +223,63 @@ io.on("connection", (socket) => {
       const botId = "BOT_" + Math.random().toString(36).substr(2, 5);
 
       rooms[code] = { 
-          players: {}, admin: socket.id, status: 'LOBBY', hasBot: true, // Marcamos que tiene bot
-          currentRound: 0, totalRounds: 3, roundTime: 60,
+          players: {}, admin: socket.id, status: 'LOBBY', hasBot: true,
+          currentRound: 0, totalRounds: DEFAULT_ROUNDS, roundTime: 60,
           stopMode: 'BLITZ', letter: "", categories: [], isPanic: false
       };
 
-      // Añadimos al BOT como si fuera un jugador más
+      // Añadir Bot
       rooms[code].players[botId] = { 
           name: botName, score: 0, wins: 0, id: botId, isBot: true,
-          avatar: 'demon', frame: 'gold_master' // El bot va chulo
+          avatar: 'demon', frame: 'gold_master' 
       };
 
-      // Añadimos al JUGADOR REAL (admin)
-      const pName = data.name;
-      rooms[code].players[socket.id] = { 
-          name: pName, score: 0, wins: 0, id: socket.id,
-          // (Asumimos avatar default hasta que el cliente lo actualice al entrar)
-          avatar: 'robot1', frame: 'none' 
-      };
-
-      console.log(`🤖 Sala BOT ${code} creada para ${pName} vs ${botName}`);
+      // Añadir Jugador (Admin) - Se rellenará bien al hacer join_room
+      // NOTA: No añadimos al jugador a rooms[code].players AQUI, 
+      // porque el cliente va a llamar a 'join_room' inmediatamente después.
+      // Solo le damos el código.
       
-      // Enviamos al jugador a esta sala
+      console.log(`🤖 Sala Bot ${code} reservada para ${data.name}`);
       socket.emit('match_found', { code: code });
-      
-      // NOTA: Cuando el jugador se una con 'join_room' (automático en la app),
-      // verá al bot en la lista. Y como el jugador es admin, podrá darle a INICIAR.
   });
 
+  // 5. STOP
   socket.on('stop_pressed', (data) => {
-     handleStop(data.roomCode, socket.id);
+      handleStop(data.roomCode);
   });
 
+  // 6. SUBMIT WORDS
   socket.on('submit_words', (data) => {
-     handleSubmitWords(data.roomCode, socket.id, data.words);
-     
-     // Si hay bot, forzar la finalización tras un pequeño delay
-     const room = rooms[data.roomCode];
-     if (room && room.hasBot) {
-         clearTimeout(room.botTimer); // El bot deja de pensar
-         setTimeout(() => finalizeRound(data.roomCode), 1000);
-     }
+      const code = data.roomCode;
+      const room = rooms[code];
+      const playerName = rooms[code].players[socket.id].name;
+      
+      if (!globalGameData[code]) { globalGameData[code] = { playerWords: {}, votes: {} }; }
+      globalGameData[code].playerWords[socket.id] = data.words; 
+
+      // Si hay bot, forzar finalización tras un momento
+      if (room && room.hasBot) {
+          if (room.botTimer) clearTimeout(room.botTimer); // Bot deja de pensar si tú acabas antes
+          
+          // Generar palabras del bot si no las tiene (porque le ganaste por velocidad)
+          const botId = Object.keys(room.players).find(id => room.players[id].isBot);
+          if (botId && !globalGameData[code].playerWords[botId]) {
+              let botWords = {};
+              room.categories.forEach(cat => botWords[cat] = `${cat} ${room.letter}`);
+              globalGameData[code].playerWords[botId] = botWords;
+          }
+
+          setTimeout(() => finalizeRound(code), 1000);
+      } else {
+          // Lógica multijugador normal (esperar a todos)
+          const allPlayers = Object.keys(room.players).length;
+          const submitted = Object.keys(globalGameData[code].playerWords).length;
+          if (submitted >= allPlayers) {
+             finalizeRound(code); // Sin fase de juicio, directo a resultados
+          }
+      }
   });
-  
+
   socket.on('send_message', (data) => { if(data.roomCode) io.to(data.roomCode).emit('receive_message', { sender: data.playerName, text: data.message }); });
   socket.on('send_reaction', (data) => { if(data.roomCode) io.to(data.roomCode).emit('receive_reaction', { emoji: data.emoji }); });
   socket.on("disconnect", () => {});
